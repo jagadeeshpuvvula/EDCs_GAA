@@ -1,0 +1,12 @@
+---
+title: "00_env_init"
+author: "Puvvula"
+date: "2025-12-09"
+output: pdf_document
+---
+
+```{r}
+library(pacman)
+pacman::p_load(tidyverse, janitor)
+```
+

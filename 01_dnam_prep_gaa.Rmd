@@ -1,0 +1,102 @@
+---
+title: "01_dnam_prep"
+author: "Puvvula"
+date: "2025-12-09"
+output: pdf_document
+---
+
+#make a copy of fetal facing DNAm data for preprocessing
+```{r}
+dnam_ref<- read_csv("~/Documents/EAA_cincinnati/dnam_lookup.csv") |>
+  filter(desc == "Fetal side placenta tissue") 
+
+# directories
+src_dir <- "/Volumes/res_archive/methylation_pilot/idat_files"
+dst_dir <- "~/Documents/EAA_cincinnati/dnam_ff/"
+
+# make destination if it doesn't exist
+dir.create(dst_dir, showWarnings = FALSE, recursive = TRUE)
+
+# all files to be copied
+files_to_copy <- unique(c(dnam_ref$file_1, dnam_ref$file_2))
+
+# full paths
+src_paths <- file.path(src_dir, files_to_copy)
+dst_paths <- file.path(dst_dir, files_to_copy)
+
+# copy
+copied <- file.copy(from = src_paths, to = dst_paths, overwrite = TRUE)
+```
+
+#preprocess 450K DNAm data
+```{r}
+basenames_df<- read_csv("~/Documents/EAA_cincinnati/meth_pheno.csv") |>
+  mutate(basename = paste0(Sentrix_ID, "_", Sentrix_Position)) |>
+  filter(
+    basename %in% str_extract(dnam_ref$file_1, "^[^_]+_[^_]+")
+  ) |>
+  mutate(
+    batch = case_when(
+      year(mdy(date)) <= 2015 ~ "Batch1",
+      year(mdy(date)) == 2016 ~ "Batch2",
+      year(mdy(date)) == 2017 ~ "Batch3",
+      year(mdy(date)) >= 2019 ~ "Batch4",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  dplyr::select(c(8,12,13))
+
+# Create the properly formatted dataframe
+basenames_df_formatted <- data.frame(
+  Sample_ID = basenames_df$basename,
+  folder_location = "~/Documents/EAA_cincinnati/dnam_ff/",
+  stringsAsFactors = FALSE
+)
+
+pheno_data <- basenames_df
+rownames(pheno_data) <- basenames_df$basename
+```
+
+```{r}
+# Match pheno_data to basenames_df_formatted by basename/Sample_ID
+basenames_df_formatted$Sample_ID <- as.character(basenames_df_formatted$Sample_ID)
+pheno_data$basename <- as.character(pheno_data$basename)
+
+# Find the order in basenames_df_formatted that matches pheno_data
+match_idx <- match(basenames_df_formatted$Sample_ID, pheno_data$basename)
+
+if (any(is.na(match_idx))) {
+  stop("Some Sample_IDs in basenames_df_formatted don't match pheno_data$basename")
+}
+
+# Reorder pheno_data to match basenames_df_formatted
+pheno_data_matched <- pheno_data[match_idx, ]
+rownames(pheno_data_matched) <- NULL  # Clear rownames before passing to function
+
+# Convert to data.frame
+pheno_data_matched <- as.data.frame(pheno_data_matched)
+```
+
+```{r}
+results <- process_methylation_data(
+  basenames_df = basenames_df_formatted,
+  pheno_data = pheno_data_matched,
+  output_folder = "~/Documents/EAA_cincinnati/dnam_prep",
+  array_type = "450k",
+  detection_pval = 0.01,
+  sample_cutoff = 0.05,
+  apply_bmiq = TRUE,
+  apply_combat = TRUE,
+  batch_variable = "batch",
+  remove_sex_chr = FALSE,
+  remove_snps = TRUE,
+  remove_cross_reactive = TRUE,
+  verbose = TRUE
+)
+```
+
+#https://www.tandfonline.com/doi/full/10.1080/15592294.2022.2102846#d1e457 
+#GAA was calculated as the residuals from a linear model of DNAm GA regressed on chronological GA as a proxy for biological ageing.
+
+
+
