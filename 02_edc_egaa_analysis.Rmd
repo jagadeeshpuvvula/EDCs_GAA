@@ -1,0 +1,158 @@
+---
+title: "02_edc_egaa_analysis"
+author: "Puvvula"
+date: "2025-12-10"
+output: pdf_document
+---
+
+#dropping 6 participants with missing covariate data
+```{r}
+load("~/Documents/EAA_cincinnati/estimated_ega/egaa_exposures.rda")
+
+analy_df<- analytic_data |>
+  clean_names() |>
+  mutate(
+    across(
+      .cols = 21:46,
+      .fns  = ~ log10(.x)
+    )
+  ) |>
+  dplyr::select(
+    egaa_cbmc_knight, egaa_fsp_mayne, egaa_fsp_lee_rpc,
+    x24_dcp, x25_dcp, bp_3,
+    bpa, bps,
+    mecptp, mehhtp, monp, m_bp, m_bz_p,
+    m_cnp, m_cop, m_ep, mi_bp,
+    fluo2, nap1, nap2, phen1,
+    phen4, phen9, phen23, pyr1, sigma_lmwt_pah,
+    mom_race, mom_edu, mom_age, pgtob, hh_inc_cat
+  ) |>
+  drop_na(mom_race, mom_edu, mom_age, pgtob, hh_inc_cat)
+
+rm(analytic_data)
+```
+
+#linear regression of EDCs on EGAA
+#parity has 12 NA values which is dropping the sample size
+```{r}
+lm_res <- lm_func(dependent_vars = c("egaa_cbmc_knight","egaa_fsp_lee_rpc"),
+        independent_vars=c("x24_dcp", "x25_dcp", "bp_3",
+                           "bpa", "bps",
+                           "mecptp", "mehhtp", "monp", "m_bp", "m_bz_p",
+                           "m_cnp","m_cop", "m_ep", "mi_bp",
+                           "fluo2", "nap1", "nap2", "phen1",
+                           "phen4", "phen9", "phen23", "pyr1", "sigma_lmwt_pah"),
+        covariates = c("mom_race", "mom_edu", "mom_age", "pgtob", "hh_inc_cat"),
+        dat = analy_df, 
+        include_sex = F, include_cohort = F)
+
+write_csv(lm_res, "~/Documents/EAA_cincinnati/results/edc_egaa_results.csv")
+```
+
+#visualization of results
+#adjusted for race, education, maternal age, pregnancy tobacco use, parity, child sex
+```{r}
+results <- read_csv("~/Documents/EAA_cincinnati/results/edc_egaa_results.csv") |>
+  mutate(
+    dependent_variable = recode(
+      dependent_variable,
+      "egaa_cbmc_knight" = "CBMC Knight",
+      "egaa_fsp_mayne" = "Placenta Mayne",
+      "egaa_fsp_lee_rpc" = "Placenta Lee RPC"
+    )
+  ) |>
+  mutate(independent_variable = recode(independent_variable,
+                                  # PAH metabolites
+                                  "nap1" = "1-Hydroxynaphthalene",
+                                  "nap2" = "2-Hydroxynaphthalene",
+                                  "fluo2" = "2-Hydroxyfluorene",
+                                  "phen1" = "1-Hydroxyphenanthrene",
+                                  "phen23" = "2,3-Hydroxyphenanthrene",
+                                  "phen4" = "4-Hydroxyphenanthrene",
+                                  "phen9" = "9-Hydroxyphenanthrene",
+                                  "pyr1" = "1-Hydroxypyrene",
+                                  "sigma_lmwt_pah" = "ΣLMW PAH",
+                                  # Low molecular weight phthalates
+                                  "m_ep" = "Monoethyl phthalate",
+                                  "m_bp" = "Mono-n-butyl phthalate",
+                                  "mi_bp" = "Mono-isobutyl phthalate",
+                                  # BzBP metabolites
+                                  "m_bz_p" = "Monobenzyl phthalate",
+                                  # DiNP metabolites  
+                                  "monp" = "Monooxononyl phthalate",
+                                  "m_cop" = "Mono carboxyisooctyl phthalate",
+                                  # DiDP metabolite
+                                  "m_cnp" = "Mono carboxyisononyl phthalate",
+                                  # DEHTP metabolites
+                                  "mecptp" = "Mono-2-ethyl-5-carboxypentyl terephthalate",
+                                  "mehhtp" = "Mono-2-ethyl-5-hydroxyhexyl terephthalate",
+                                  # Disinfectant by-products     
+                                  "x25_dcp" = "2,4-Dichlorophenol",
+                                  "x24_dcp" = "2,5-Dichlorophenol",
+                                  # Personal Care Products
+                                  "bp_3" = "Benzophenone-3",
+                                  # Bisphenols
+                                  "bpa" = "Bisphenol A",
+                                  "bps" = "Bisphenol S"
+                                  )) |>
+  filter(dependent_variable != "Placenta Mayne") |>
+  mutate(
+    
+    independent_variable = factor(independent_variable, levels = c(
+      "Bisphenol A", "Bisphenol S", "Benzophenone-3", 
+      "Monoethyl phthalate", "Mono-n-butyl phthalate", "Mono-isobutyl phthalate", 
+      "Monobenzyl phthalate", "Monooxononyl phthalate", "Mono carboxyisooctyl phthalate",
+      "Mono carboxyisononyl phthalate", 
+      "Mono-2-ethyl-5-carboxypentyl terephthalate", "Mono-2-ethyl-5-hydroxyhexyl terephthalate",
+      "2,4-Dichlorophenol", "2,5-Dichlorophenol", 
+      "1-Hydroxynaphthalene", "2-Hydroxynaphthalene", "2-Hydroxyfluorene",
+      "1-Hydroxyphenanthrene", "2,3-Hydroxyphenanthrene", "4-Hydroxyphenanthrene",
+      "9-Hydroxyphenanthrene", "1-Hydroxypyrene", "ΣLMW PAH"
+    )),
+    # Create group variable
+    group = case_when(
+      independent_variable %in% c("1-Hydroxynaphthalene","2-Hydroxynaphthalene","2-Hydroxyfluorene",
+                                  "1-Hydroxyphenanthrene","2,3-Hydroxyphenanthrene",
+                                  "4-Hydroxyphenanthrene","9-Hydroxyphenanthrene",
+                                  "1-Hydroxypyrene","ΣLMW PAH") ~ "PAH metabolites",
+      independent_variable %in% c("Monoethyl phthalate","Mono-n-butyl phthalate","Mono-isobutyl phthalate") ~ "Low molecular weight phthalates",
+      independent_variable %in% c("Monobenzyl phthalate") ~ "BzBP metabolites",
+      independent_variable %in% c("Monooxononyl phthalate", "Mono carboxyisooctyl phthalate") ~ "DiNP metabolites",
+      independent_variable %in% c("Mono carboxyisononyl phthalate") ~ "DiDP metabolite",
+      independent_variable %in% c("Mono-2-ethyl-5-carboxypentyl terephthalate","Mono-2-ethyl-5-hydroxyhexyl terephthalate") ~ "DEHTP metabolites",
+      independent_variable %in% c("2,4-Dichlorophenol","2,5-Dichlorophenol") ~ "Disinfectant by-products",
+      independent_variable %in% c("Benzophenone-3") ~ "Personal Care Products",
+      independent_variable %in% c("Bisphenol A","Bisphenol S") ~ "Bisphenols",
+      TRUE ~ "Other"
+    ),
+    
+    group = factor(group, levels = c(
+      "PAH metabolites", "Low molecular weight phthalates", "BzBP metabolites", "DiNP metabolites",
+      "DiDP metabolite", "DEHTP metabolites", "Disinfectant by-products", "Personal Care Products", "Bisphenols"
+    ))
+  )
+
+
+
+#plotting
+ggplot(results, aes(y = independent_variable, x = coefficient, color = dependent_variable)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbar(aes(xmin = ci_lower, xmax = ci_upper), width = 0.2,
+                position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dotted") +  # dotted line along x = 0
+  theme_minimal() +
+  facet_grid(group ~ dependent_variable, scales = "free", space = "free_y") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1, colour = "black", size = 12),
+        axis.text.y = element_text(colour = "black", size = 10),
+        strip.text.y = element_blank(),
+        strip.text.x = element_text(size = 10, colour = "black"),
+        legend.position = "bottom") +
+  labs(x = "Estimate (95%CI)", y = " ") +
+  ggtitle(" ") +
+  scale_color_discrete(name = "EGAA Clocks", 
+                       labels = c("CBMC Knight", "Placenta Lee RPC")) #"Placenta Mayne", 
+
+ggsave("~/Documents/EAA_cincinnati/results/edc_egaa_results.tiff", width = 7, height = 8,
+       units = "in", dpi = 300, bg="white")
+```
+

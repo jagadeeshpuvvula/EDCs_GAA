@@ -5,6 +5,7 @@ date: "2025-12-09"
 output: pdf_document
 ---
 
+#updated on Dec 10, 2025
 ```{r}
 process_methylation_data <- function(basenames_df, 
                                      pheno_data = NULL,
@@ -18,6 +19,7 @@ process_methylation_data <- function(basenames_df,
                                      remove_sex_chr = TRUE,
                                      remove_snps = TRUE,
                                      remove_cross_reactive = TRUE,
+                                     cross_reactive_file = NULL,
                                      verbose = TRUE) {
   
   # Suppress matrixStats useNames deprecation warning
@@ -37,6 +39,11 @@ process_methylation_data <- function(basenames_df,
   
   # Track probe counts at each step for summary
   probe_counts <- list()
+  processing_log <- list(
+    bmiq_applied = FALSE,
+    combat_applied = FALSE,
+    failed_samples_bmiq = c()
+  )
   
   # ========== 0. Validate Inputs and Create Output Folder ==========
   if (verbose) cat("\n=== Validating inputs ===\n")
@@ -48,6 +55,12 @@ process_methylation_data <- function(basenames_df,
   required_cols <- c("Sample_ID", "folder_location")
   if (!all(required_cols %in% colnames(basenames_df))) {
     stop("basenames_df must contain columns: Sample_ID, folder_location")
+  }
+  
+  # Check for duplicate sample IDs
+  if (any(duplicated(basenames_df$Sample_ID))) {
+    dup_ids <- basenames_df$Sample_ID[duplicated(basenames_df$Sample_ID)]
+    stop("Duplicate Sample_IDs found: ", paste(unique(dup_ids), collapse = ", "))
   }
   
   if (verbose) {
@@ -70,6 +83,14 @@ process_methylation_data <- function(basenames_df,
   }
   
   if (verbose) cat("All IDAT files found\n")
+  
+  # Validate batch variable if ComBat will be applied
+  if (apply_combat) {
+    if (is.null(batch_variable)) {
+      warning("apply_combat is TRUE but batch_variable is NULL. ComBat will be skipped.")
+      apply_combat <- FALSE
+    }
+  }
   
   if (!dir.exists(output_folder)) {
     dir.create(output_folder, recursive = TRUE)
@@ -139,13 +160,16 @@ process_methylation_data <- function(basenames_df,
   }
   print_dims(mSetSq, "After Noob normalization")
   
-  # ========== 4. Extract Beta Values (BEFORE probe filtering - include all probes) ==========
+  # Clean up memory
+  rm(rgSet)
+  gc(verbose = FALSE)
+  
+  # ========== 4. Extract Beta Values (BEFORE probe filtering) ==========
   if (verbose) cat("\n=== Extracting beta values ===\n")
   beta <- minfi::getBeta(mSetSq)
   
   if (verbose) {
     cat("Class of beta: ", paste(class(beta), collapse = ", "), "\n")
-    cat("is.null(beta): ", is.null(beta), "\n")
   }
   
   if (is.null(beta) || nrow(beta) == 0) {
@@ -155,204 +179,230 @@ process_methylation_data <- function(basenames_df,
   if (verbose) {
     cat("Beta matrix dimensions after getBeta: ", 
         paste(dim(beta), collapse = " x "), "\n")
-    cat("Example probe names: ", paste(head(rownames(beta), 3), collapse = ", "), "\n")
   }
   
   print_dims(beta, "After extracting beta values")
   probe_counts$after_noob <- nrow(beta)
   
+  # Clean up memory
+  rm(mSetSq)
+  gc(verbose = FALSE)
+  
   # ========== 5. BMIQ Normalization (Optional - BEFORE probe filtering) ==========
   if (apply_bmiq) {
     if (verbose) cat("\n=== Applying BMIQ normalization ===\n")
     
-    # Get design vector from the annotation
-    if (array_type == "450k") {
-      ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-      design <- rep(NA_integer_, length = nrow(beta))
-      names(design) <- rownames(beta)
-      
-      matched_idx <- match(rownames(beta), rownames(ann450k))
-      valid_matches <- !is.na(matched_idx)
-      
-      design[valid_matches][ann450k$Type[matched_idx[valid_matches]] == "I"] <- 1
-      design[valid_matches][ann450k$Type[matched_idx[valid_matches]] == "II"] <- 2
-      
-      if (verbose) {
-        cat("Annotation Type I probes: ", sum(ann450k$Type == "I", na.rm = TRUE), "\n")
-        cat("Annotation Type II probes: ", sum(ann450k$Type == "II", na.rm = TRUE), "\n")
-        cat("Matches found in beta: ", sum(valid_matches), " out of ", nrow(beta), "\n")
-      }
-      
-    } else if (array_type %in% c("EPIC", "EPICv2")) {
-      annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-      design <- rep(NA_integer_, length = nrow(beta))
-      names(design) <- rownames(beta)
-      
-      matched_idx <- match(rownames(beta), rownames(annEPIC))
-      valid_matches <- !is.na(matched_idx)
-      
-      design[valid_matches][annEPIC$Type[matched_idx[valid_matches]] == "I"] <- 1
-      design[valid_matches][annEPIC$Type[matched_idx[valid_matches]] == "II"] <- 2
-      
-      if (verbose) {
-        cat("Annotation Type I probes: ", sum(annEPIC$Type == "I", na.rm = TRUE), "\n")
-        cat("Annotation Type II probes: ", sum(annEPIC$Type == "II", na.rm = TRUE), "\n")
-        cat("Matches found in beta: ", sum(valid_matches), " out of ", nrow(beta), "\n")
-      }
-    }
-    
-    valid <- !is.na(design)
-    
-    if (verbose) {
-      cat("Probes with valid design assignment: ", sum(valid), " out of ", nrow(beta), "\n")
-    }
-    
-    if (sum(valid) == 0) {
-      if (verbose) cat("Warning: No probes with valid design types. Skipping BMIQ.\n")
-    } else {
-      beta  <- beta[valid, , drop = FALSE]
-      design <- design[valid]
-      
-      design_table <- table(design)
-      if (verbose) {
-        cat("Probe design distribution:\n")
-        print(design_table)
-      }
-      
-      if (length(design_table) < 2) {
-        if (verbose) cat("Warning: Only one probe type present. Skipping BMIQ normalization.\n")
-      } else {
-        beta_bmiq <- beta
-        failed_samples <- 0
+    tryCatch({
+      # Get design vector from the annotation
+      if (array_type == "450k") {
+        ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+        design <- rep(NA_integer_, length = nrow(beta))
+        names(design) <- rownames(beta)
         
-        for (i in seq_len(ncol(beta))) {
-          if (verbose && i %% 10 == 0) cat("  Processing sample ", i, "/", ncol(beta), "\n", sep = "")
+        matched_idx <- match(rownames(beta), rownames(ann450k))
+        valid_matches <- !is.na(matched_idx)
+        
+        design[valid_matches][ann450k$Type[matched_idx[valid_matches]] == "I"] <- 1
+        design[valid_matches][ann450k$Type[matched_idx[valid_matches]] == "II"] <- 2
+        
+        if (verbose) {
+          cat("Annotation Type I probes: ", sum(ann450k$Type == "I", na.rm = TRUE), "\n")
+          cat("Annotation Type II probes: ", sum(ann450k$Type == "II", na.rm = TRUE), "\n")
+          cat("Matches found in beta: ", sum(valid_matches), " out of ", nrow(beta), "\n")
+        }
+        
+      } else if (array_type %in% c("EPIC", "EPICv2")) {
+        annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+        design <- rep(NA_integer_, length = nrow(beta))
+        names(design) <- rownames(beta)
+        
+        matched_idx <- match(rownames(beta), rownames(annEPIC))
+        valid_matches <- !is.na(matched_idx)
+        
+        design[valid_matches][annEPIC$Type[matched_idx[valid_matches]] == "I"] <- 1
+        design[valid_matches][annEPIC$Type[matched_idx[valid_matches]] == "II"] <- 2
+        
+        if (verbose) {
+          cat("Annotation Type I probes: ", sum(annEPIC$Type == "I", na.rm = TRUE), "\n")
+          cat("Annotation Type II probes: ", sum(annEPIC$Type == "II", na.rm = TRUE), "\n")
+          cat("Matches found in beta: ", sum(valid_matches), " out of ", nrow(beta), "\n")
+        }
+      }
+      
+      valid <- !is.na(design)
+      
+      if (verbose) {
+        cat("Probes with valid design assignment: ", sum(valid), " out of ", nrow(beta), "\n")
+      }
+      
+      if (sum(valid) == 0) {
+        if (verbose) cat("Warning: No probes with valid design types. Skipping BMIQ.\n")
+      } else {
+        beta  <- beta[valid, , drop = FALSE]
+        design <- design[valid]
+        
+        design_table <- table(design)
+        if (verbose) {
+          cat("Probe design distribution:\n")
+          print(design_table)
+        }
+        
+        if (length(design_table) < 2) {
+          if (verbose) cat("Warning: Only one probe type present. Skipping BMIQ normalization.\n")
+        } else {
+          beta_bmiq <- beta
+          failed_samples <- c()
           
-          beta_sample <- beta[, i]
-          na_probes <- is.na(beta_sample)
-          
-          if (sum(na_probes) > 0) {
-            beta_sample_clean <- beta_sample[!na_probes]
-            design_clean <- design[!na_probes]
-          } else {
-            beta_sample_clean <- beta_sample
-            design_clean <- design
-          }
-          
-          if (length(table(design_clean)) < 2) {
-            if (verbose && failed_samples == 0) {
-              cat("  Warning: Sample ", i, " missing one probe type. Using original values.\n", sep = "")
+          for (i in seq_len(ncol(beta))) {
+            if (verbose && (i %% 50 == 0 || i == ncol(beta))) {
+              cat("  Processing sample ", i, "/", ncol(beta), "\n", sep = "")
             }
-            failed_samples <- failed_samples + 1
-            next
-          }
-          
-          tryCatch({
-            suppressMessages({
-              capture.output({
-                bmiq_result <- BMIQ(beta_sample_clean, design_clean)
-              })
-            })
+            
+            beta_sample <- beta[, i]
+            na_probes <- is.na(beta_sample)
             
             if (sum(na_probes) > 0) {
-              beta_bmiq[!na_probes, i] <- bmiq_result$nbeta
+              beta_sample_clean <- beta_sample[!na_probes]
+              design_clean <- design[!na_probes]
             } else {
-              beta_bmiq[, i] <- bmiq_result$nbeta
+              beta_sample_clean <- beta_sample
+              design_clean <- design
             }
-          }, error = function(e) {
-            if (verbose && failed_samples == 0) {
-              cat("  Warning: BMIQ failed for sample ", i, ". Using original values.\n", sep = "")
+            
+            if (length(table(design_clean)) < 2) {
+              failed_samples <- c(failed_samples, colnames(beta)[i])
+              next
             }
-            failed_samples <<- failed_samples + 1
-          })
+            
+            tryCatch({
+              suppressMessages({
+                capture.output({
+                  bmiq_result <- BMIQ(beta_sample_clean, design_clean)
+                })
+              })
+              
+              if (sum(na_probes) > 0) {
+                beta_bmiq[!na_probes, i] <- bmiq_result$nbeta
+              } else {
+                beta_bmiq[, i] <- bmiq_result$nbeta
+              }
+            }, error = function(e) {
+              failed_samples <<- c(failed_samples, colnames(beta)[i])
+            })
+          }
+          
+          beta <- beta_bmiq
+          processing_log$bmiq_applied <- TRUE
+          processing_log$failed_samples_bmiq <- failed_samples
+          
+          if (length(failed_samples) > 0 && verbose) {
+            cat("BMIQ failed for ", length(failed_samples), " sample(s): ", 
+                paste(failed_samples, collapse = ", "), "\n", sep = "")
+            cat("Using original values for failed samples.\n")
+          }
+          if (verbose) cat("BMIQ normalization complete\n")
         }
-        
-        beta <- beta_bmiq
-        
-        if (failed_samples > 0 && verbose) {
-          cat("BMIQ failed for ", failed_samples, " sample(s). Using original values for those samples.\n", sep = "")
-        }
-        if (verbose) cat("BMIQ normalization complete\n")
       }
-    }
-    
-    print_dims(beta, "After BMIQ normalization")
-    
-    # Clamp beta values to [0, 1] range - keep as matrix using element-wise assignment
-    beta[beta < 0] <- 0
-    beta[beta > 1] <- 1
-    
-    if (verbose) {
-      cat("Beta values clamped to [0, 1] range\n")
-      cat("Min beta value after clamping: ", min(beta), "\n")
-      cat("Max beta value after clamping: ", max(beta), "\n")
-    }
+      
+      print_dims(beta, "After BMIQ normalization")
+      
+      # Clamp beta values to [0, 1] range
+      beta[beta < 0] <- 0
+      beta[beta > 1] <- 1
+      
+      if (verbose) {
+        cat("Beta values clamped to [0, 1] range\n")
+      }
+      
+    }, error = function(e) {
+      if (verbose) {
+        cat("Error in BMIQ normalization: ", e$message, "\n")
+        cat("Proceeding without BMIQ normalization.\n")
+      }
+      processing_log$bmiq_applied <<- FALSE
+    })
   }
+  
+  probe_counts$after_normalization <- nrow(beta)
   
   # ========== 6. Batch Correction (Optional, AFTER BMIQ) ==========
   if (apply_combat && !is.null(batch_variable)) {
     if (verbose) cat("\n=== Applying ComBat batch correction ===\n")
     
-    if (!(batch_variable %in% colnames(pheno_data))) {
-      stop("Batch variable '", batch_variable, "' not found in pheno_data")
-    }
-    
-    batch <- pheno_data[[batch_variable]]
-    
-    # Ensure beta is a matrix
-    if (!is.matrix(beta)) {
-      beta <- as.matrix(beta)
-    }
-    
-    if (verbose) {
-      cat("Beta matrix dimensions before ComBat: ", paste(dim(beta), collapse = " x "), "\n")
-      cat("Batch variable table:\n")
-      print(table(batch, useNA = "ifany"))
-    }
-    
-    # Safety checks before ComBat
-    if (is.null(dim(beta)) || nrow(beta) == 0L) {
-      if (verbose) cat("Warning: No probes or invalid beta structure; skipping ComBat.\n")
-    } else if (any(is.na(batch))) {
-      if (verbose) cat("Warning: Batch vector contains NA values; skipping ComBat.\n")
-    } else if (length(batch) != ncol(beta)) {
-      if (verbose) cat("Warning: Batch vector length (", length(batch), ") does not match number of samples (", ncol(beta), "); skipping ComBat.\n", sep = "")
-    } else {
-      batch_table <- table(batch)
-      if (any(batch_table < 2) && verbose) {
-        cat("Warning: Some batches have fewer than 2 samples. ComBat may fail.\n")
-        print(batch_table)
+    tryCatch({
+      if (!(batch_variable %in% colnames(pheno_data))) {
+        stop("Batch variable '", batch_variable, "' not found in pheno_data")
       }
       
-      tryCatch({
-        batch <- as.factor(batch)
-        
-        beta_combat <- ComBat(dat = beta, batch = batch, mod = NULL, par.prior = TRUE)
-        
-        # Ensure result is a matrix with proper dimensions
-        if (!is.matrix(beta_combat)) {
-          beta_combat <- as.matrix(beta_combat)
-          rownames(beta_combat) <- rownames(beta)
-          colnames(beta_combat) <- colnames(beta)
-        }
-        
-        beta <- beta_combat
-        
-        if (verbose) cat("ComBat batch correction complete\n")
+      batch <- pheno_data[[batch_variable]]
+      
+      # Ensure beta is a matrix
+      if (!is.matrix(beta)) {
+        beta <- as.matrix(beta)
+      }
+      
+      if (verbose) {
+        cat("Beta matrix dimensions before ComBat: ", paste(dim(beta), collapse = " x "), "\n")
+        cat("Batch variable table:\n")
+        print(table(batch, useNA = "ifany"))
+      }
+      
+      # Comprehensive safety checks
+      if (is.null(dim(beta)) || nrow(beta) == 0L) {
+        stop("No probes or invalid beta structure")
+      }
+      
+      if (any(is.na(batch))) {
+        stop("Batch vector contains NA values")
+      }
+      
+      if (length(batch) != ncol(beta)) {
+        stop("Batch vector length (", length(batch), ") does not match number of samples (", ncol(beta), ")")
+      }
+      
+      # Check if batch can be converted to factor
+      batch_test <- tryCatch({
+        as.factor(batch)
       }, error = function(e) {
-        if (verbose) {
-          cat("Warning: ComBat failed. Proceeding without batch correction.\n")
-          cat("Error message: ", e$message, "\n")
-        }
+        stop("Batch variable cannot be converted to factor: ", e$message)
       })
-    }
+      
+      batch_table <- table(batch)
+      if (any(batch_table < 2)) {
+        warning("Some batches have fewer than 2 samples. ComBat may fail or produce unreliable results.")
+        if (verbose) print(batch_table)
+      }
+      
+      batch <- as.factor(batch)
+      
+      beta_combat <- ComBat(dat = beta, batch = batch, mod = NULL, par.prior = TRUE)
+      
+      # Ensure result is a matrix with proper dimensions
+      if (!is.matrix(beta_combat)) {
+        beta_combat <- as.matrix(beta_combat)
+        rownames(beta_combat) <- rownames(beta)
+        colnames(beta_combat) <- colnames(beta)
+      }
+      
+      beta <- beta_combat
+      processing_log$combat_applied <- TRUE
+      
+      if (verbose) cat("ComBat batch correction complete\n")
+      
+    }, error = function(e) {
+      if (verbose) {
+        cat("Warning: ComBat failed. Proceeding without batch correction.\n")
+        cat("Error message: ", e$message, "\n")
+      }
+      processing_log$combat_applied <<- FALSE
+    })
     
     # Ensure beta is a matrix after ComBat
     if (!is.matrix(beta)) {
       beta <- as.matrix(beta)
     }
     
-    # Clamp beta values to [0, 1] range after batch correction - keep as matrix
+    # Clamp beta values to [0, 1] range after batch correction
     beta[beta < 0] <- 0
     beta[beta > 1] <- 1
     
@@ -360,14 +410,12 @@ process_methylation_data <- function(basenames_df,
     
     if (verbose) {
       cat("Beta values clamped to [0, 1] range after ComBat\n")
-      cat("Min beta value: ", min(beta), "\n")
-      cat("Max beta value: ", max(beta), "\n")
     }
   }
   
-  probe_counts$after_bmiq_combat <- nrow(beta)
+  probe_counts$after_batch_correction <- nrow(beta)
   
-  # ========== 7. Probe-level QC (detection p-value) - AFTER normalization ==========
+  # ========== 7. Probe-level QC (detection p-value) ==========
   if (verbose) cat("\n=== Probe-level QC (detection p-value) ===\n")
   failed_probe_count <- rowSums(detP > detection_pval)
   keep_probes <- failed_probe_count == 0
@@ -389,28 +437,33 @@ process_methylation_data <- function(basenames_df,
   if (remove_sex_chr) {
     if (verbose) cat("\n=== Removing sex chromosome probes ===\n")
     
-    if (array_type == "450k") {
-      data(Locations)
-      annotation <- Locations
-    } else if (array_type %in% c("EPIC", "EPICv2")) {
-      data(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-      annotation <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-    }
-    
-    sex_probes <- rownames(annotation)[annotation$chr %in% c("chrX", "chrY")]
-    keep_probes <- !(rownames(beta) %in% sex_probes)
-    probes_removed_sex <- sum(!keep_probes)
-    
-    if (verbose) {
-      cat("Sex chromosome probes removed: ", probes_removed_sex, "\n")
-    }
-    
-    beta <- beta[keep_probes, , drop = FALSE]
-    detP <- detP[keep_probes, , drop = FALSE]
-    
-    print_dims(beta, "After removing sex chromosome probes")
-    probe_counts$after_sex_chr_filter <- nrow(beta)
+    tryCatch({
+      if (array_type == "450k") {
+        data(Locations)
+        annotation <- Locations
+      } else if (array_type %in% c("EPIC", "EPICv2")) {
+        data(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+        annotation <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+      }
+      
+      sex_probes <- rownames(annotation)[annotation$chr %in% c("chrX", "chrY")]
+      keep_probes <- !(rownames(beta) %in% sex_probes)
+      probes_removed_sex <- sum(!keep_probes)
+      
+      if (verbose) {
+        cat("Sex chromosome probes removed: ", probes_removed_sex, "\n")
+      }
+      
+      beta <- beta[keep_probes, , drop = FALSE]
+      detP <- detP[keep_probes, , drop = FALSE]
+      
+      print_dims(beta, "After removing sex chromosome probes")
+      
+    }, error = function(e) {
+      if (verbose) cat("Warning: Could not remove sex chromosome probes: ", e$message, "\n")
+    })
   }
+  probe_counts$after_sex_chr_filter <- nrow(beta)
   
   # ========== 9. Remove Cross-Reactive Probes ==========
   probes_removed_crossreactive <- 0
@@ -418,11 +471,22 @@ process_methylation_data <- function(basenames_df,
     if (verbose) cat("\n=== Removing cross-reactive probes ===\n")
     
     tryCatch({
-      xReactiveProbes <- read_csv(
-        "https://epigen.ccm.sickkids.ca/sample-report/data/quality_control/cross_reactive_probes.csv",
-        col_names = c("TargetID"),
-        show_col_types = FALSE
-      )
+      # Try user-provided file first, then fall back to URL
+      if (!is.null(cross_reactive_file) && file.exists(cross_reactive_file)) {
+        if (verbose) cat("Loading cross-reactive probes from local file: ", cross_reactive_file, "\n")
+        xReactiveProbes <- read_csv(
+          cross_reactive_file,
+          col_names = c("TargetID"),
+          show_col_types = FALSE
+        )
+      } else {
+        if (verbose) cat("Loading cross-reactive probes from URL...\n")
+        xReactiveProbes <- read_csv(
+          "https://epigen.ccm.sickkids.ca/sample-report/data/quality_control/cross_reactive_probes.csv",
+          col_names = c("TargetID"),
+          show_col_types = FALSE
+        )
+      }
       
       keep_probes <- !(rownames(beta) %in% xReactiveProbes$TargetID)
       probes_removed_crossreactive <- sum(!keep_probes)
@@ -435,61 +499,72 @@ process_methylation_data <- function(basenames_df,
       detP <- detP[keep_probes, , drop = FALSE]
       
       print_dims(beta, "After removing cross-reactive probes")
-      probe_counts$after_crossreactive_filter <- nrow(beta)
       
     }, error = function(e) {
-      if (verbose) cat("Warning: Could not load cross-reactive probes list. Skipping this step.\n")
-      probe_counts$after_crossreactive_filter <<- nrow(beta)
+      if (verbose) {
+        cat("Warning: Could not load cross-reactive probes list.\n")
+        cat("Error: ", e$message, "\n")
+        cat("Skipping this step.\n")
+      }
     })
   }
+  probe_counts$after_crossreactive_filter <- nrow(beta)
   
   # ========== 10. Remove SNP Probes ==========
   probes_removed_snps <- 0
   if (remove_snps) {
     if (verbose) cat("\n=== Removing probes with SNPs ===\n")
     
-    initial_probes <- nrow(beta)
-    
-    if (array_type == "450k") {
-      ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-      common_probes <- intersect(rownames(beta), rownames(ann450k))
-      beta_temp <- beta[common_probes, , drop = FALSE]
+    tryCatch({
+      initial_probes <- nrow(beta)
       
-      grSet_temp <- makeGenomicRatioSetFromMatrix(
-        beta_temp,
-        array = "IlluminaHumanMethylation450k",
-        annotation = "ilmn12.hg19",
-        what = "Beta"
-      )
-    } else if (array_type %in% c("EPIC", "EPICv2")) {
-      annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-      common_probes <- intersect(rownames(beta), rownames(annEPIC))
-      beta_temp <- beta[common_probes, , drop = FALSE]
+      if (array_type == "450k") {
+        ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+        common_probes <- intersect(rownames(beta), rownames(ann450k))
+        beta_temp <- beta[common_probes, , drop = FALSE]
+        
+        grSet_temp <- makeGenomicRatioSetFromMatrix(
+          beta_temp,
+          array = "IlluminaHumanMethylation450k",
+          annotation = "ilmn12.hg19",
+          what = "Beta"
+        )
+      } else if (array_type %in% c("EPIC", "EPICv2")) {
+        annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+        common_probes <- intersect(rownames(beta), rownames(annEPIC))
+        beta_temp <- beta[common_probes, , drop = FALSE]
+        
+        grSet_temp <- makeGenomicRatioSetFromMatrix(
+          beta_temp,
+          array = "IlluminaHumanMethylationEPIC",
+          annotation = "ilm10b4.hg19",
+          what = "Beta"
+        )
+      }
       
-      grSet_temp <- makeGenomicRatioSetFromMatrix(
-        beta_temp,
-        array = "IlluminaHumanMethylationEPIC",
-        annotation = "ilm10b4.hg19",
-        what = "Beta"
-      )
-    }
-    
-    grSet_temp <- dropLociWithSnps(grSet_temp, snps = c("SBE", "CpG"), maf = 0)
-    
-    snp_filtered_probes <- rownames(grSet_temp)
-    keep_probes <- rownames(beta) %in% snp_filtered_probes
-    probes_removed_snps <- initial_probes - sum(keep_probes)
-    
-    if (verbose) {
-      cat("Probes with SNPs removed: ", probes_removed_snps, "\n")
-    }
-    
-    beta <- beta[keep_probes, , drop = FALSE]
-    detP <- detP[keep_probes, , drop = FALSE]
-    
-    print_dims(beta, "After removing SNP probes")
-    probe_counts$after_snp_filter <- nrow(beta)
+      grSet_temp <- dropLociWithSnps(grSet_temp, snps = c("SBE", "CpG"), maf = 0)
+      
+      snp_filtered_probes <- rownames(grSet_temp)
+      keep_probes <- rownames(beta) %in% snp_filtered_probes
+      probes_removed_snps <- initial_probes - sum(keep_probes)
+      
+      if (verbose) {
+        cat("Probes with SNPs removed: ", probes_removed_snps, "\n")
+      }
+      
+      beta <- beta[keep_probes, , drop = FALSE]
+      detP <- detP[keep_probes, , drop = FALSE]
+      
+      print_dims(beta, "After removing SNP probes")
+      
+    }, error = function(e) {
+      if (verbose) {
+        cat("Warning: Could not remove SNP probes: ", e$message, "\n")
+        cat("Proceeding without SNP probe removal.\n")
+      }
+    })
   }
+  probe_counts$after_snp_filter <- nrow(beta)
   
   # ========== 11. Create Final GenomicRatioSet ==========
   if (verbose) cat("\n=== Creating final GenomicRatioSet ===\n")
@@ -498,149 +573,208 @@ process_methylation_data <- function(basenames_df,
     stop("Beta matrix is empty. Something went wrong in filtering/normalization steps.")
   }
   
-  if (array_type == "450k") {
-    ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-    valid_probes <- intersect(rownames(beta), rownames(ann450k))
+  tryCatch({
+    if (array_type == "450k") {
+      ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+      valid_probes <- intersect(rownames(beta), rownames(ann450k))
+      
+      if (verbose) {
+        cat("Probes in beta: ", nrow(beta), "\n")
+        cat("Valid probes matching 450k annotation: ", length(valid_probes), "\n")
+      }
+      
+      if (length(valid_probes) == 0) {
+        stop("No row names in beta match IlluminaHumanMethylation450k probe names. ",
+             "Check that rownames are cg IDs (e.g., cg00000029, cg00000108, ...).")
+      }
+      
+      beta <- beta[valid_probes, , drop = FALSE]
+      beta <- beta[order(match(rownames(beta), rownames(ann450k))), , drop = FALSE]
+      
+      grSet <- makeGenomicRatioSetFromMatrix(
+        beta,
+        array = "IlluminaHumanMethylation450k",
+        annotation = "ilmn12.hg19",
+        what = "Beta"
+      )
+      
+    } else if (array_type %in% c("EPIC", "EPICv2")) {
+      annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+      valid_probes <- intersect(rownames(beta), rownames(annEPIC))
+      
+      if (verbose) {
+        cat("Probes in beta: ", nrow(beta), "\n")
+        cat("Valid probes matching EPIC annotation: ", length(valid_probes), "\n")
+      }
+      
+      if (length(valid_probes) == 0) {
+        stop("No row names in beta match IlluminaHumanMethylationEPIC probe names.")
+      }
+      
+      beta <- beta[valid_probes, , drop = FALSE]
+      beta <- beta[order(match(rownames(beta), rownames(annEPIC))), , drop = FALSE]
+      
+      grSet <- makeGenomicRatioSetFromMatrix(
+        beta,
+        array = "IlluminaHumanMethylationEPIC",
+        annotation = "ilm10b4.hg19",
+        what = "Beta"
+      )
+    }
+    
+    # Assign phenotype data using colData
+    pheno_data <- as.data.frame(pheno_data)
+    pheno_data <- pheno_data[colnames(grSet), , drop = FALSE]
+    colData(grSet) <- S4Vectors::DataFrame(pheno_data)
+    
+    print_dims(grSet, "Final dataset")
     
     if (verbose) {
-      cat("Probes in beta: ", nrow(beta), "\n")
-      cat("Valid probes matching 450k annotation: ", length(valid_probes), "\n")
+      cat("\n=== Processing complete ===\n")
+      cat("Total probes retained: ", nrow(grSet), " (", 
+          round(nrow(grSet) / probe_counts$initial * 100, 1), "% of original)\n", sep = "")
+      cat("Total samples retained: ", ncol(grSet), " (", 
+          round(ncol(grSet) / nrow(basenames_df) * 100, 1), "% of original)\n", sep = "")
     }
     
-    if (length(valid_probes) == 0) {
-      stop("No row names in beta match IlluminaHumanMethylation450k probe names. ",
-           "Check that rownames are cg IDs (e.g., cg00000029, cg00000108, ...).")
-    }
-    
-    beta <- beta[valid_probes, , drop = FALSE]
-    beta <- beta[order(match(rownames(beta), rownames(ann450k))), , drop = FALSE]
-    
-    grSet <- makeGenomicRatioSetFromMatrix(
-      beta,
-      array = "IlluminaHumanMethylation450k",
-      annotation = "ilmn12.hg19",
-      what = "Beta"
-    )
-    
-  } else if (array_type %in% c("EPIC", "EPICv2")) {
-    annEPIC <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
-    valid_probes <- intersect(rownames(beta), rownames(annEPIC))
-    
-    if (verbose) {
-      cat("Probes in beta: ", nrow(beta), "\n")
-      cat("Valid probes matching EPIC annotation: ", length(valid_probes), "\n")
-    }
-    
-    if (length(valid_probes) == 0) {
-      stop("No row names in beta match IlluminaHumanMethylationEPIC probe names.")
-    }
-    
-    beta <- beta[valid_probes, , drop = FALSE]
-    beta <- beta[order(match(rownames(beta), rownames(annEPIC))), , drop = FALSE]
-    
-    grSet <- makeGenomicRatioSetFromMatrix(
-      beta,
-      array = "IlluminaHumanMethylationEPIC",
-      annotation = "ilm10b4.hg19",
-      what = "Beta"
-    )
-  }
-  
-  # Assign phenotype data using colData
-  pheno_data <- as.data.frame(pheno_data)
-  pheno_data <- pheno_data[colnames(grSet), , drop = FALSE]
-  colData(grSet) <- S4Vectors::DataFrame(pheno_data)
-  
-  print_dims(grSet, "Final dataset")
-  
-  if (verbose) {
-    cat("\n=== Processing complete ===\n")
-    cat("Total probes retained: ", nrow(grSet), " (", 
-        round(nrow(grSet) / nrow(rgSet) * 100, 1), "% of original)\n", sep = "")
-    cat("Total samples retained: ", ncol(grSet), " (", 
-        round(ncol(grSet) / nrow(basenames_df) * 100, 1), "% of original)\n", sep = "")
-  }
+  }, error = function(e) {
+    stop("Error creating GenomicRatioSet: ", e$message)
+  })
   
   # ========== 12. Save Results ==========
   if (verbose) cat("\n=== Saving results to ", output_folder, " ===\n", sep = "")
   
-  grSet_file <- file.path(output_folder, "grSet.rda")
-  save(grSet, file = grSet_file)
-  if (verbose) cat("Saved grSet to: ", grSet_file, "\n")
+  save_success <- TRUE
   
-  beta_file <- file.path(output_folder, "beta.rda")
-  save(beta, file = beta_file)
-  if (verbose) cat("Saved beta to: ", beta_file, "\n")
+  tryCatch({
+    grSet_file <- file.path(output_folder, "grSet.rda")
+    save(grSet, file = grSet_file)
+    if (!file.exists(grSet_file)) stop("grSet file was not created")
+    if (verbose) cat("Saved grSet to: ", grSet_file, "\n")
+  }, error = function(e) {
+    warning("Failed to save grSet: ", e$message)
+    save_success <<- FALSE
+  })
   
-  detP_file <- file.path(output_folder, "detP.rda")
-  save(detP, file = detP_file)
-  if (verbose) cat("Saved detP to: ", detP_file, "\n")
+  tryCatch({
+    beta_file <- file.path(output_folder, "beta.rda")
+    save(beta, file = beta_file)
+    if (!file.exists(beta_file)) stop("beta file was not created")
+    if (verbose) cat("Saved beta to: ", beta_file, "\n")
+  }, error = function(e) {
+    warning("Failed to save beta: ", e$message)
+    save_success <<- FALSE
+  })
   
-  pheno_data_file <- file.path(output_folder, "pheno_data.rda")
-  save(pheno_data, file = pheno_data_file)
-  if (verbose) cat("Saved pheno_data to: ", pheno_data_file, "\n")
+  tryCatch({
+    detP_file <- file.path(output_folder, "detP.rda")
+    save(detP, file = detP_file)
+    if (!file.exists(detP_file)) stop("detP file was not created")
+    if (verbose) cat("Saved detP to: ", detP_file, "\n")
+  }, error = function(e) {
+    warning("Failed to save detP: ", e$message)
+    save_success <<- FALSE
+  })
   
-  summary_file <- file.path(output_folder, "processing_summary.txt")
-  sink(summary_file)
-  cat("DNA Methylation Processing Summary\n")
-  cat("===================================\n\n")
-  cat("Processing Date: ", as.character(Sys.time()), "\n\n")
-  cat("Array Type: ", array_type, "\n")
-  cat("Detection p-value threshold: ", detection_pval, "\n")
-  cat("Sample cutoff: ", sample_cutoff * 100, "%\n", sep = "")
-  cat("BMIQ applied: ", apply_bmiq, "\n")
-  cat("ComBat applied: ", apply_combat, "\n")
-  if (!is.null(batch_variable)) cat("Batch variable: ", batch_variable, "\n")
-  cat("Sex chromosomes removed: ", remove_sex_chr, "\n")
-  cat("SNP probes removed: ", remove_snps, "\n")
-  cat("Cross-reactive probes removed: ", remove_cross_reactive, "\n\n")
+  tryCatch({
+    pheno_data_file <- file.path(output_folder, "pheno_data.rda")
+    save(pheno_data, file = pheno_data_file)
+    if (!file.exists(pheno_data_file)) stop("pheno_data file was not created")
+    if (verbose) cat("Saved pheno_data to: ", pheno_data_file, "\n")
+  }, error = function(e) {
+    warning("Failed to save pheno_data: ", e$message)
+    save_success <<- FALSE
+  })
   
-  cat("========== PROBE FILTERING SUMMARY ==========\n\n")
-  cat("Initial probes (raw): ", probe_counts$initial, "\n")
-  cat("After Noob normalization: ", probe_counts$after_noob, " (no probes removed)\n")
-  cat("After BMIQ/ComBat normalization: ", probe_counts$after_bmiq_combat, " (no probes removed)\n")
-  cat("After detection p-value filtering: ", probe_counts$after_detection_filter, 
-      " (removed: ", probes_removed_detection, ")\n", sep = "")
+  # Save processing summary
+  tryCatch({
+    summary_file <- file.path(output_folder, "processing_summary.txt")
+    sink(summary_file)
+    cat("DNA Methylation Processing Summary\n")
+    cat("===================================\n\n")
+    cat("Processing Date: ", as.character(Sys.time()), "\n\n")
+    cat("Array Type: ", array_type, "\n")
+    cat("Detection p-value threshold: ", detection_pval, "\n")
+    cat("Sample cutoff: ", sample_cutoff * 100, "%\n", sep = "")
+    cat("BMIQ applied: ", processing_log$bmiq_applied, "\n")
+    cat("ComBat applied: ", processing_log$combat_applied, "\n")
+    if (!is.null(batch_variable)) cat("Batch variable: ", batch_variable, "\n")
+    cat("Sex chromosomes removed: ", remove_sex_chr, "\n")
+    cat("SNP probes removed: ", remove_snps, "\n")
+    cat("Cross-reactive probes removed: ", remove_cross_reactive, "\n\n")
+    
+    if (processing_log$bmiq_applied && length(processing_log$failed_samples_bmiq) > 0) {
+      cat("BMIQ failed samples (", length(processing_log$failed_samples_bmiq), "): ",
+          paste(processing_log$failed_samples_bmiq, collapse = ", "), "\n\n", sep = "")
+    }
+    
+    cat("========== PROBE FILTERING SUMMARY ==========\n\n")
+    cat("Initial probes (raw): ", probe_counts$initial, "\n")
+    cat("After Noob normalization: ", probe_counts$after_noob, " (no probes removed)\n")
+    
+    if (processing_log$bmiq_applied || processing_log$combat_applied) {
+      cat("After normalization (BMIQ/ComBat): ", probe_counts$after_normalization, " (no probes removed)\n")
+    }
+    
+    if (processing_log$combat_applied) {
+      cat("After batch correction: ", probe_counts$after_batch_correction, " (no probes removed)\n")
+    }
+    
+    cat("After detection p-value filtering: ", probe_counts$after_detection_filter, 
+        " (removed: ", probe_counts$after_normalization - probe_counts$after_detection_filter, ")\n", sep = "")
+    
+    if (remove_sex_chr) {
+      cat("After sex chromosome removal: ", probe_counts$after_sex_chr_filter, 
+          " (removed: ", probe_counts$after_detection_filter - probe_counts$after_sex_chr_filter, ")\n", sep = "")
+    }
+    
+    if (remove_cross_reactive) {
+      cat("After cross-reactive removal: ", probe_counts$after_crossreactive_filter, 
+          " (removed: ", probe_counts$after_sex_chr_filter - probe_counts$after_crossreactive_filter, ")\n", sep = "")
+    }
+    
+    if (remove_snps) {
+      cat("After SNP removal: ", probe_counts$after_snp_filter, 
+          " (removed: ", probe_counts$after_crossreactive_filter - probe_counts$after_snp_filter, ")\n", sep = "")
+    }
+    
+    total_probes_removed <- probe_counts$initial - nrow(grSet)
+    cat("\nTotal probes removed: ", total_probes_removed, 
+        " (", round(total_probes_removed / probe_counts$initial * 100, 1), "% of original)\n\n", sep = "")
+    
+    cat("========== SAMPLE SUMMARY ==========\n\n")
+    cat("Initial samples: ", nrow(basenames_df), "\n")
+    cat("Final samples: ", ncol(grSet), "\n")
+    cat("Samples removed: ", nrow(basenames_df) - ncol(grSet), "\n\n")
+    
+    cat("========== FINAL DATASET ==========\n\n")
+    cat("Final dimensions: ", nrow(grSet), " probes x ", ncol(grSet), " samples\n")
+    cat("Probes retained: ", round(nrow(grSet) / probe_counts$initial * 100, 1), "% of original\n", sep = "")
+    cat("Samples retained: ", round(ncol(grSet) / nrow(basenames_df) * 100, 1), "% of original\n", sep = "")
+    
+    cat("\n========== BETA VALUE RANGE ==========\n\n")
+    cat("Min beta value: ", min(beta), "\n")
+    cat("Max beta value: ", max(beta), "\n")
+    cat("Mean beta value: ", mean(beta), "\n")
+    cat("Median beta value: ", median(beta), "\n")
+    
+    sink()
+    
+    if (!file.exists(summary_file)) stop("Summary file was not created")
+    if (verbose) cat("Saved processing summary to: ", summary_file, "\n")
+    
+  }, error = function(e) {
+    warning("Failed to save processing summary: ", e$message)
+    save_success <<- FALSE
+  })
   
-  if (remove_sex_chr) {
-    cat("After sex chromosome removal: ", probe_counts$after_sex_chr_filter, 
-        " (removed: ", probes_removed_sex, ")\n", sep = "")
+  if (verbose) {
+    if (save_success) {
+      cat("\n=== All files saved successfully ===\n")
+    } else {
+      cat("\n=== WARNING: Some files failed to save ===\n")
+    }
   }
-  
-  if (remove_cross_reactive) {
-    cat("After cross-reactive removal: ", probe_counts$after_crossreactive_filter, 
-        " (removed: ", probes_removed_crossreactive, ")\n", sep = "")
-  }
-  
-  if (remove_snps) {
-    cat("After SNP removal: ", probe_counts$after_snp_filter, 
-        " (removed: ", probes_removed_snps, ")\n", sep = "")
-  }
-  
-  total_probes_removed <- probe_counts$initial - nrow(grSet)
-  cat("\nTotal probes removed: ", total_probes_removed, 
-      " (", round(total_probes_removed / probe_counts$initial * 100, 1), "% of original)\n\n", sep = "")
-  
-  cat("========== SAMPLE SUMMARY ==========\n\n")
-  cat("Initial samples: ", nrow(basenames_df), "\n")
-  cat("Final samples: ", ncol(grSet), "\n")
-  cat("Samples removed: ", nrow(basenames_df) - ncol(grSet), "\n\n")
-  
-  cat("========== FINAL DATASET ==========\n\n")
-  cat("Final dimensions: ", nrow(grSet), " probes x ", ncol(grSet), " samples\n")
-  cat("Probes retained: ", round(nrow(grSet) / probe_counts$initial * 100, 1), "% of original\n", sep = "")
-  cat("Samples retained: ", round(ncol(grSet) / nrow(basenames_df) * 100, 1), "% of original\n", sep = "")
-  
-  cat("\n========== BETA VALUE RANGE ==========\n\n")
-  cat("Min beta value: ", min(beta), "\n")
-  cat("Max beta value: ", max(beta), "\n")
-  cat("Mean beta value: ", mean(beta), "\n")
-  cat("Median beta value: ", median(beta), "\n")
-  
-  sink()
-  
-  if (verbose) cat("Saved processing summary to: ", summary_file, "\n")
-  if (verbose) cat("\n=== All files saved successfully ===\n")
   
   invisible(list(
     grSet = grSet,
@@ -648,7 +782,9 @@ process_methylation_data <- function(basenames_df,
     detP = detP,
     pheno_data = pheno_data,
     output_folder = output_folder,
-    probe_counts = probe_counts
+    probe_counts = probe_counts,
+    processing_log = processing_log,
+    save_success = save_success
   ))
 }
 ```

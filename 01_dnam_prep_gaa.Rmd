@@ -5,6 +5,10 @@ date: "2025-12-09"
 output: pdf_document
 ---
 
+###############################################################################
+#Pre-process Fetal side placenta DNAm data to estimate Epigenetic Gestational Age (EGA)
+###############################################################################
+
 #make a copy of fetal facing DNAm data for preprocessing
 ```{r}
 dnam_ref<- read_csv("~/Documents/EAA_cincinnati/dnam_lookup.csv") |>
@@ -81,7 +85,7 @@ pheno_data_matched <- as.data.frame(pheno_data_matched)
 results <- process_methylation_data(
   basenames_df = basenames_df_formatted,
   pheno_data = pheno_data_matched,
-  output_folder = "~/Documents/EAA_cincinnati/dnam_prep",
+  output_folder = "~/Documents/EAA_cincinnati/dnam_prep_fsp",
   array_type = "450k",
   detection_pval = 0.01,
   sample_cutoff = 0.05,
@@ -95,8 +99,269 @@ results <- process_methylation_data(
 )
 ```
 
+###############################################################################
+#Pre-process CBMC DNAm data to estimate Epigenetic Gestational Age (EGA)
+###############################################################################
+```{r}
+dnam_ref<- read_csv("~/Documents/EAA_cincinnati/dnam_lookup.csv") |>
+  filter(desc == "Cord blood mono nuclear cells") 
+
+# directories
+src_dir <- "/Volumes/res_archive/methylation_pilot/idat_files"
+dst_dir <- "~/Documents/EAA_cincinnati/dnam_cbmc/"
+
+# make destination if it doesn't exist
+dir.create(dst_dir, showWarnings = FALSE, recursive = TRUE)
+
+# all files to be copied
+files_to_copy <- unique(c(dnam_ref$file_1, dnam_ref$file_2))
+
+# full paths
+src_paths <- file.path(src_dir, files_to_copy)
+dst_paths <- file.path(dst_dir, files_to_copy)
+
+# copy
+copied <- file.copy(from = src_paths, to = dst_paths, overwrite = TRUE)
+```
+
+#prep data to preprocess
+```{r}
+basenames_df<- read_csv("~/Documents/EAA_cincinnati/meth_pheno.csv") |>
+  mutate(basename = paste0(Sentrix_ID, "_", Sentrix_Position)) |>
+  filter(
+    basename %in% str_extract(dnam_ref$file_1, "^[^_]+_[^_]+")
+  ) |>
+  mutate(
+    batch = case_when(
+      year(mdy(date)) <= 2015 ~ "Batch1",
+      year(mdy(date)) == 2016 ~ "Batch2",
+      year(mdy(date)) == 2017 ~ "Batch3",
+      year(mdy(date)) >= 2019 ~ "Batch4",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  dplyr::select(c(8,12,13))
+
+# Create the properly formatted dataframe
+basenames_df_formatted <- data.frame(
+  Sample_ID = basenames_df$basename,
+  folder_location = "~/Documents/EAA_cincinnati/dnam_cbmc/",
+  stringsAsFactors = FALSE
+)
+
+pheno_data <- basenames_df
+rownames(pheno_data) <- basenames_df$basename
+
+# Match pheno_data to basenames_df_formatted by basename/Sample_ID
+basenames_df_formatted$Sample_ID <- as.character(basenames_df_formatted$Sample_ID)
+pheno_data$basename <- as.character(pheno_data$basename)
+
+# Find the order in basenames_df_formatted that matches pheno_data
+match_idx <- match(basenames_df_formatted$Sample_ID, pheno_data$basename)
+
+if (any(is.na(match_idx))) {
+  stop("Some Sample_IDs in basenames_df_formatted don't match pheno_data$basename")
+}
+
+# Reorder pheno_data to match basenames_df_formatted
+pheno_data_matched <- pheno_data[match_idx, ]
+rownames(pheno_data_matched) <- NULL  # Clear rownames before passing to function
+
+# Convert to data.frame
+pheno_data_matched <- as.data.frame(pheno_data_matched)
+```
+
+```{r}
+results <- process_methylation_data(
+  basenames_df = basenames_df_formatted,
+  pheno_data = pheno_data_matched,
+  output_folder = "~/Documents/EAA_cincinnati/dnam_prep_cbmc",
+  array_type = "450k",
+  detection_pval = 0.01,
+  sample_cutoff = 0.05,
+  apply_bmiq = TRUE,
+  apply_combat = TRUE,
+  batch_variable = "batch",
+  remove_sex_chr = FALSE,
+  remove_snps = TRUE,
+  remove_cross_reactive = TRUE,
+  verbose = TRUE
+)
+```
+
+###############################################################################
+#Estimate Epigenetic Gestational Age (EGA) using Mayne’s and Lee’s RPC clocks
+###############################################################################
+#estimating EGA
+```{r}
+#Mayne’s clock: It uses 62 CpGs described in Mayne et al. (2017)
+#Lee’s RPC clock: RPC clock: Robust placental clock (RPC) uses 558 CpG sites. Lee et al. (2019)
+library(planet); library(methylclock)
+
+#get EGA for DNAm FSP
+load("~/Documents/EAA_cincinnati/dnam_prep/beta.rda")
+
+#1 cpg is missing for Mayne algorithm & all cpgs present for Lee.RPC
+clock_qc<- checkClocksGA(beta)
+
+# Now this matches the vignette’s MethylationData example
+dnam_fsp<- DNAmGA(beta, min.perc = 0.95) |>
+  select(c("id", "Mayne", "Lee.RPC")) |>
+  clean_names()
+
+#get EGA for DNAm CBMC
+load("~/Documents/EAA_cincinnati/dnam_prep_cbmc/beta.rda")
+
+#all cpgs present for Knight algorithm
+clock_qc<- checkClocksGA(beta)
+
+dnam_cbmc<- DNAmGA(beta, min.perc = 0.95) |>
+  dplyr::select(c("id", "Knight")) |>
+  clean_names()
+
+#Export EGA estimates
+write_csv(dnam_fsp, "~/Documents/EAA_cincinnati/dnam_fsp_ega_estimates.csv")
+write_csv(dnam_cbmc, "~/Documents/EAA_cincinnati/dnam_cbmc_ega_estimates.csv")
+```
+
+#read ega amd estimate EGAA
+```{r}
+basenames_df<- read_csv("~/Documents/EAA_cincinnati/meth_pheno.csv") |>
+  mutate(id = paste0(Sentrix_ID, "_", Sentrix_Position)) |>
+  dplyr::select(c(8,12)) 
+
+dnam_fsp_ega<- read_csv("~/Documents/EAA_cincinnati/estimated_ega/dnam_fsp_ega_estimates.csv") |>
+  left_join(basenames_df, by = "id") 
+dnam_cbmc_ega<- read_csv("~/Documents/EAA_cincinnati/estimated_ega/dnam_cbmc_ega_estimates.csv")|>
+  left_join(basenames_df, by = "id") 
+
+#merge EGA estimates from FSP and CBMC
+ega_ef<- left_join(dnam_fsp_ega, dnam_cbmc_ega, by = "participant_id") |>
+  rename(
+    ega_fsp_mayne = mayne,
+    ega_fsp_lee_rpc = lee_rpc,
+    ega_cbmc_knight = knight
+  ) |>
+  clean_names() |>
+  dplyr::select(c(4,6,2,3)) |>
+  mutate(across(where(is.numeric),
+                ~ as.numeric(sprintf("%.2f", .x))))
+
+write_csv(ega_ef, "~/Documents/EAA_cincinnati/estimated_ega/ega_estimates_fsp_cbmc.csv")
+```
+
+#scatter plots across three variables using plotly
+```{r}
+#get epigenetic gestational 
+hh_inc<- read_csv("~/Documents/EAA_cincinnati/exp_cov/qn_dat.csv") |> dplyr::select(c(1,2))|>
+  rename(participant_id = group)
+
+covars <- read_csv("~/Documents/EAA_cincinnati/exp_cov/covar.csv") |>
+  clean_names() |>
+  select(c(2:6, 8:15)) |>
+  rename(participant_id = group) |>
+  mutate(across(everything(), ~ na_if(as.character(.x), "."))) |>
+  left_join(hh_inc, by = "participant_id")|>
+  mutate(
+    across(c(mom_race, mari_st, mom_edu, pgtob, livebirth, csec, sex, hh_inc_cat), as.factor),
+    across(c(ga_w, mom_age, totpg, mom_ppbmi, babywt_g), as.numeric)
+  ) |>
+  mutate(
+    mom_edu = case_when(
+      mom_edu %in% c("Bachelor's degree", "Master's degree or above") ~ "bach-or-abv",
+      mom_edu %in% c("12 years (or graduated from high school)", "Less than 12 years",
+                     "Some college or Associate degree") ~ "bel_bach",
+      TRUE ~ mom_edu   
+    ),
+    mom_race = case_when(
+      mom_race == "Non-Hispanic White" ~ "White",
+      mom_race %in% c("African American", "Asian", "Hispanic", "Other") ~ "non_White",
+      TRUE ~ mom_race  
+    ),
+    mari_st = case_when(
+      mari_st == "Married or living with a partner" ~ "M_w_partner",
+      mari_st %in% c("Other", "Single") ~ "wo_partner",
+      TRUE ~ mari_st
+    )
+    #mom_edu  = if_else(is.na(mom_edu), "lt-bach", mom_edu),
+    #pgtob    = if_else(is.na(pgtob), "No", pgtob),
+    #mom_age   = if_else(is.na(mom_age),   median(mom_age,   na.rm = TRUE), mom_age),
+    #totpg     = if_else(is.na(totpg),     median(totpg,     na.rm = TRUE), totpg),
+    #mom_ppbmi = if_else(is.na(mom_ppbmi), median(mom_ppbmi, na.rm = TRUE), mom_ppbmi),
+    #babywt_g  = if_else(is.na(babywt_g),  median(babywt_g,  na.rm = TRUE), babywt_g)
+  )  |>
+  mutate(
+    across(c(mom_race, mari_st, mom_edu, pgtob, livebirth, csec, sex, hh_inc_cat), as.factor),
+    across(c(ga_w, mom_age, totpg, mom_ppbmi, babywt_g), as.numeric)
+  ) 
+
 #https://www.tandfonline.com/doi/full/10.1080/15592294.2022.2102846#d1e457 
 #GAA was calculated as the residuals from a linear model of DNAm GA regressed on chronological GA as a proxy for biological ageing.
+est_egaa <- read_csv("~/Documents/EAA_cincinnati/estimated_ega/ega_estimates_fsp_cbmc.csv") %>%
+  left_join(covars, by = "participant_id") %>%
+  mutate(
+    egaa_cbmc_knight = {
+      df <- drop_na(cur_data(), ega_cbmc_knight, ga_w)
+      out <- rep(NA_real_, n())
+      out[match(df$participant_id, participant_id)] <- augment(lm(ega_cbmc_knight ~ ga_w, df))$.resid
+      out
+    },
+    egaa_fsp_mayne = {
+      df <- drop_na(cur_data(), ega_fsp_mayne, ga_w)
+      out <- rep(NA_real_, n())
+      out[match(df$participant_id, participant_id)] <- augment(lm(ega_fsp_mayne ~ ga_w, df))$.resid
+      out
+    },
+    egaa_fsp_lee_rpc = {
+      df <- drop_na(cur_data(), ega_fsp_lee_rpc, ga_w)
+      out <- rep(NA_real_, n())
+      out[match(df$participant_id, participant_id)] <- augment(lm(ega_fsp_lee_rpc ~ ga_w, df))$.resid
+      out
+    }
+  ) %>%
+  mutate(
+    across(
+      c(egaa_cbmc_knight, egaa_fsp_mayne, egaa_fsp_lee_rpc),
+      ~ as.numeric(sprintf("%.2f", .x))
+    )
+  )
+
+save(est_egaa, file="~/Documents/EAA_cincinnati/estimated_ega/egaa_estimates_fsp_cbmc.rda")
+```
+
+#link with exposure data 
+```{r}
+#link exposure data
+pah<- read_sas("~/Documents/EAA_cincinnati/exp_cov/pahmetabolitewide3.sas7bdat") |>
+  select(-ends_with("concentrationcr"), -ends_with("BelowLOD"), -ends_with("units")) |>
+  mutate(fluo2 = if_else(FLUO2comment_code == 37, FLUO2LOD/sqrt(2), FLUO2concentration),
+         nap1 = if_else(NAP1comment_code == 37, NAP1LOD/sqrt(2), NAP1concentration),
+         nap2 = if_else(NAP2comment_code == 37, NAP2LOD/sqrt(2), NAP2concentration),
+         phen1 = if_else(PHEN1comment_code == 37, PHEN1LOD/sqrt(2), PHEN1concentration),
+         phen4 = if_else(PHEN4comment_code == 37, PHEN4LOD/sqrt(2), PHEN4concentration),
+         phen9 = if_else(PHEN9comment_code == 37, PHEN9LOD/sqrt(2), PHEN9concentration),
+         phen23 = if_else(PHEN23comment_code == 37, PHEN23LOD/sqrt(2), PHEN23concentration),
+         pyr1 = if_else(PYR1comment_code == 37, PYR1LOD/sqrt(2), PYR1concentration)) |>
+  select(c(1, 26:34)) |>
+  mutate_at(vars(3:10), ~ . / creatinine * 100)|>
+  mutate(sigma_lmwt_pah=fluo2+nap1+nap2+phen1+phen4+phen9+phen23)|>
+  select(-c(creatinine))
+
+edc_biomarkers<- read_csv("~/Documents/EAA_cincinnati/exp_cov/all_chem.csv") |> dplyr::select(c(1:30)) |>
+  rename(participant_id = group) |>
+  select(-c(b_pb, bpf, tcc, tcs, mcoch, m_hi_nch, m_cpp, 
+            m_ecpp, m_ehhp, m_ehp, m_eohp, m_np)) |>
+  left_join(pah, by="participant_id")
+
+#analytic dataset
+analytic_data<- est_egaa |>
+  left_join(edc_biomarkers, by="participant_id") |>
+  drop_na(bps)
+
+#export analytic dataset
+save(analytic_data, file="~/Documents/EAA_cincinnati/estimated_ega/egaa_exposures.rda")
+```
+
 
 
 
