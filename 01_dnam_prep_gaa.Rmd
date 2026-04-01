@@ -128,7 +128,7 @@ copied <- file.copy(from = src_paths, to = dst_paths, overwrite = TRUE)
 ```{r}
 basenames_df<- read_csv("~/Documents/EAA_cincinnati/meth_pheno.csv") |>
   mutate(basename = paste0(Sentrix_ID, "_", Sentrix_Position)) |>
-  filter(
+  dplyr::filter(
     basename %in% str_extract(dnam_ref$file_1, "^[^_]+_[^_]+")
   ) |>
   mutate(

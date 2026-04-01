@@ -25,7 +25,8 @@ analy_df<- analytic_data |>
     m_cnp, m_cop, m_ep, mi_bp,
     fluo2, nap1, nap2, phen1,
     phen4, phen9, phen23, pyr1, sigma_lmwt_pah,
-    mom_race, mom_edu, mom_age, pgtob, hh_inc_cat
+    mom_race, mom_edu, mom_age, pgtob, hh_inc_cat,
+    ga_w, babywt_g, sex, ega_cbmc_knight, ega_fsp_lee_rpc
   ) |>
   drop_na(mom_race, mom_edu, mom_age, pgtob, hh_inc_cat)
 
@@ -155,4 +156,15 @@ ggplot(results, aes(y = independent_variable, x = coefficient, color = dependent
 ggsave("~/Documents/EAA_cincinnati/results/edc_egaa_results.tiff", width = 7, height = 8,
        units = "in", dpi = 300, bg="white")
 ```
+
+#viz for paper - scatter plot between gest_age and egaa_fsp_lee_rpc
+```{r}
+#ega_cbmc_knight, ega_fsp_lee_rpc
+ggplot(analy_df, aes(x = babywt_g, y = egaa_cbmc_knight, colour = sex)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_minimal() +
+  labs(x = "Gestational Age (weeks)", y = "EGA Knight CBMC")
+```
+
 
